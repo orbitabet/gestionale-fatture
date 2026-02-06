@@ -1,17 +1,21 @@
 import streamlit as st
 import pandas as pd
-import os
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
+import os
 
-# --- CONFIGURAZIONE PAGINA (Deve essere la prima istruzione) ---
+# --- CONFIGURAZIONE PAGINA (Prima istruzione obbligatoria) ---
 st.set_page_config(
-    page_title="Gestionale Fatture & Pagamenti",
-    page_icon="💼",
+    page_title="Gestionale Fatture (Cloud)", 
+    page_icon="☁️", 
     layout="wide"
 )
 
-# --- FILE DATABASE ---
-FILE_DATI = 'fatture_db.csv'
+# --- CONFIGURAZIONE GOOGLE SHEETS ---
+# Il nome del tuo foglio Google creato in precedenza
+SHEET_NAME = "gestionale_db" 
+SCOPE = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
 
 # --- COLONNE ---
 COLONNE = [
@@ -20,203 +24,214 @@ COLONNE = [
     "Saldo (€)", "Stato", "Data Saldo"
 ]
 
-# --- FUNZIONI UTILI ---
-def clean_column_names(df):
+# --- CONNESSIONE GOOGLE ---
+def connect_google():
+    """Si connette a Google Sheets usando i segreti di Streamlit."""
+    try:
+        if "gcp_service_account" not in st.secrets:
+            st.error("Mancano le chiavi segrete (Secrets) nelle impostazioni di Streamlit!")
+            st.stop()
+            
+        creds_dict = dict(st.secrets["gcp_service_account"])
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, SCOPE)
+        client = gspread.authorize(creds)
+        sheet = client.open(SHEET_NAME).sheet1
+        return sheet
+    except Exception as e:
+        st.error(f"Errore connessione Google: {e}")
+        st.stop()
+
+# --- CARICAMENTO DATI ---
+def load_data():
+    sheet = connect_google()
+    try:
+        data = sheet.get_all_records()
+        df = pd.DataFrame(data)
+        
+        # Se il foglio è vuoto
+        if df.empty:
+            return pd.DataFrame(columns=COLONNE)
+
+        # Assicura presenza tutte colonne
+        for col in COLONNE:
+            if col not in df.columns:
+                df[col] = ""
+
+        # Pulizia numeri (Gestione formati europei e stringhe)
+        cols_num = ["Importo Fatt. (€)", "Importo Pagato (€)", "Saldo (€)"]
+        for col in cols_num:
+            df[col] = pd.to_numeric(
+                df[col].astype(str).str.replace('€','').str.replace('.','').str.replace(',','.'), 
+                errors='coerce'
+            ).fillna(0)
+            
+        return df[COLONNE]
+    except Exception as e:
+        # Se fallisce (es. foglio vuoto senza intestazioni), ritorna vuoto
+        return pd.DataFrame(columns=COLONNE)
+
+# --- SALVATAGGIO DATI ---
+def save_data(df):
+    sheet = connect_google()
+    try:
+        sheet.clear() # Pulisce il foglio
+        # Prepara i dati per Google (converte tutto in stringa per sicurezza)
+        dati_lista = [df.columns.values.tolist()] + df.astype(str).values.tolist()
+        sheet.update(dati_lista)
+    except Exception as e:
+        st.error(f"Errore salvataggio Cloud: {e}")
+
+# --- CALCOLI ---
+def calcola_stato_saldo(row):
+    # Converte in float gestendo eventuali virgole
+    importo = float(str(row["Importo Fatt. (€)"]).replace(',','.'))
+    pagato = float(str(row["Importo Pagato (€)"]).replace(',','.'))
+    saldo = importo - pagato
+    
+    stato = "Non Pagata"
+    data_saldo = row["Data Saldo"]
+    
+    if saldo <= 0.01:
+        saldo = 0
+        stato = "Pagata"
+        if pd.isna(data_saldo) or str(data_saldo).strip() in ["", "nan"]:
+            data_saldo = datetime.today().strftime("%d/%m/%Y")
+    elif pagato > 0:
+        stato = "Parziale"
+        
+    return saldo, stato, data_saldo
+
+# --- FUNZIONI CSV (Per importazione) ---
+def clean_column_names_csv(df):
     new_columns = []
     for col in df.columns:
-        col_clean = col.replace('ï»¿', '').replace('ïbb¿', '') # Toglie BOM
-        col_clean = col_clean.replace('â\x82¬', '€').replace('â¬', '€').replace('ð', '€') # Toglie errori Euro
-        col_clean = col_clean.strip()
-        new_columns.append(col_clean)
+        col = col.replace('ï»¿', '').replace('ïbb¿', '')
+        col = col.replace('â\x82¬', '€').replace('â¬', '€').replace('ð', '€')
+        new_columns.append(col.strip())
     df.columns = new_columns
     return df
 
-def try_read_csv(file_source):
+def try_read_csv_upload(file_source):
     separators = [';', ',']
     encodings = ['ISO-8859-1', 'utf-8-sig', 'cp1252']
-    
     for sep in separators:
         for enc in encodings:
             try:
                 if hasattr(file_source, 'seek'): file_source.seek(0)
                 df = pd.read_csv(file_source, sep=sep, encoding=enc)
-                df = clean_column_names(df)
-                if len(df.columns) > 1 and "Cliente" in df.columns:
-                    return df
-            except Exception:
-                continue
-    if hasattr(file_source, 'seek'): file_source.seek(0)
-    return pd.read_csv(file_source, sep=None, engine='python', encoding='ISO-8859-1')
-
-def load_data():
-    if os.path.exists(FILE_DATI):
-        try:
-            df = try_read_csv(FILE_DATI)
-            cols_to_numeric = ["Importo Fatt. (€)", "Importo Pagato (€)", "Saldo (€)"]
-            for col in cols_to_numeric:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(
-                        df[col].astype(str).str.replace('€', '').str.replace(',', '.'), 
-                        errors='coerce'
-                    ).fillna(0)
-            for col in COLONNE:
-                if col not in df.columns: df[col] = ""
-            return df[COLONNE]
-        except Exception as e:
-            st.error(f"Errore caricamento: {e}")
-            return pd.DataFrame(columns=COLONNE)
-    else:
-        return pd.DataFrame(columns=COLONNE)
-
-def save_data(df):
-    try:
-        # Salviamo con punto e virgola (Excel Friendly)
-        df.to_csv(FILE_DATI, index=False, sep=';', encoding='utf-8-sig')
-    except Exception as e:
-        st.error(f"Errore salvataggio: {e}")
-
-def calcola_stato_saldo(row):
-    importo = float(row["Importo Fatt. (€)"])
-    pagato = float(row["Importo Pagato (€)"])
-    saldo = importo - pagato
-    stato = "Non Pagata"
-    data_saldo = row["Data Saldo"]
-
-    if saldo <= 0.01: 
-        saldo = 0
-        stato = "Pagata"
-        if pd.isna(data_saldo) or str(data_saldo).strip() == "":
-            data_saldo = datetime.today().strftime("%d/%m/%Y")
-    elif pagato > 0:
-        stato = "Parziale"
-    return saldo, stato, data_saldo
+                df = clean_column_names_csv(df)
+                if len(df.columns) > 1 and "Cliente" in df.columns: return df
+            except: continue
+    return pd.DataFrame() # Vuoto se fallisce
 
 # --- INTERFACCIA ---
 with st.sidebar:
-    # --- LOGICA LOGO INTELLIGENTE (AGGIUNTA QUI) ---
-    if os.path.exists("logo.png"):
-        st.image("logo.png", width=250)
-    elif os.path.exists("logo.jpg"):
-        st.image("logo.jpg", width=250)
-    elif os.path.exists("logo.jpeg"):
-        st.image("logo.jpeg", width=250)
-    else:
-        # Se non trova nulla, lascia uno spazio vuoto ma non da errore
-        st.write("") 
-        
+    # LOGO
+    if os.path.exists("logo.png"): st.image("logo.png", width=250)
+    elif os.path.exists("logo.jpg"): st.image("logo.jpg", width=250)
+    
     st.title("Menu")
     scelta = st.radio("Vai a:", ["Dashboard & Analisi", "Inserisci Fattura", "Gestione Tabella", "Importa CSV"])
     st.markdown("---")
-    st.caption("Gestionale V. 1.4")
+    st.success("🟢 Connesso a Google Sheets")
 
 df = load_data()
 
-# 1. DASHBOARD AVANZATA
+# 1. DASHBOARD
 if scelta == "Dashboard & Analisi":
-    st.title("📊 Dashboard Aziendale")
-    
+    st.title("📊 Dashboard Cloud")
     if not df.empty:
-        # --- TOTALI GENERALI ---
-        st.markdown("### 🌍 Situazione Generale")
-        col1, col2, col3 = st.columns(3)
+        c1, c2, c3 = st.columns(3)
         tot_fatt = df["Importo Fatt. (€)"].sum()
         tot_pag = df["Importo Pagato (€)"].sum()
         tot_saldo = df["Saldo (€)"].sum()
         
-        col1.metric("Totale Fatturato", f"€ {tot_fatt:,.2f}")
-        col2.metric("Totale Incassato", f"€ {tot_pag:,.2f}")
-        col3.metric("TOTALE DA INCASSARE", f"€ {tot_saldo:,.2f}", delta_color="inverse")
+        c1.metric("Totale Fatturato", f"€ {tot_fatt:,.2f}")
+        c2.metric("Incassato", f"€ {tot_pag:,.2f}")
+        c3.metric("DA INCASSARE", f"€ {tot_saldo:,.2f}", delta_color="inverse")
         
         st.markdown("---")
-        
-        # --- ANALISI PER CLIENTE ---
         st.header("👤 Analisi Cliente")
+        clienti = sorted(df["Cliente"].astype(str).unique().tolist())
+        sel_cli = st.selectbox("Seleziona Cliente:", ["-- Riepilogo --"] + clienti)
         
-        lista_clienti = sorted(df["Cliente"].astype(str).unique().tolist())
-        cliente_selezionato = st.selectbox("Seleziona un Cliente:", ["-- Riepilogo Tutti i Clienti --"] + lista_clienti)
-
-        if cliente_selezionato != "-- Riepilogo Tutti i Clienti --":
-            # FILTRO DATI
-            df_cliente = df[df["Cliente"] == cliente_selezionato]
+        if sel_cli != "-- Riepilogo --":
+            sub = df[df["Cliente"] == sel_cli]
+            c_fatt = sub["Importo Fatt. (€)"].sum()
+            c_pag = sub["Importo Pagato (€)"].sum()
+            c_sal = sub["Saldo (€)"].sum()
             
-            c_fatt = df_cliente["Importo Fatt. (€)"].sum()
-            c_pag = df_cliente["Importo Pagato (€)"].sum()
-            c_saldo = df_cliente["Saldo (€)"].sum()
-            
-            c1, c2, c3 = st.columns(3)
-            c1.metric(f"Fatturato {cliente_selezionato}", f"€ {c_fatt:,.2f}")
-            c2.metric("Pagato", f"€ {c_pag:,.2f}")
-            c3.metric("Debito residuo", f"€ {c_saldo:,.2f}", delta_color="inverse")
-            
-            st.subheader(f"Storico Fatture: {cliente_selezionato}")
-            st.dataframe(df_cliente, use_container_width=True)
-            
+            kc1, kc2, kc3 = st.columns(3)
+            kc1.metric("Fatturato", f"€ {c_fatt:,.2f}")
+            kc2.metric("Pagato", f"€ {c_pag:,.2f}")
+            kc3.metric("Debito", f"€ {c_sal:,.2f}", delta_color="inverse")
+            st.dataframe(sub, use_container_width=True)
         else:
-            # RIEPILOGO TUTTI
-            st.subheader("🏆 Classifica Clienti (Debitori)")
-            riepilogo = df.groupby("Cliente")[["Importo Fatt. (€)", "Importo Pagato (€)", "Saldo (€)"]].sum().reset_index()
-            riepilogo = riepilogo.sort_values(by="Saldo (€)", ascending=False)
-            st.dataframe(riepilogo, use_container_width=True)
-
+            # Classifica debitori
+            grp = df.groupby("Cliente")[["Saldo (€)"]].sum().reset_index().sort_values("Saldo (€)", ascending=False)
+            st.bar_chart(grp.set_index("Cliente"))
     else:
-        st.info("Nessun dato presente. Importa un file CSV o inserisci fatture.")
+        st.info("Database vuoto. Inserisci fatture o importa CSV.")
 
 # 2. INSERIMENTO
 elif scelta == "Inserisci Fattura":
-    st.header("➕ Nuova Fattura")
-    with st.form("form_fattura"):
+    st.header("➕ Nuova Fattura (Cloud)")
+    with st.form("form"):
         c1, c2 = st.columns(2)
-        cliente = c1.text_input("Ragione Sociale Cliente")
-        n_fatt = c2.text_input("Numero Fattura")
-        data_f = c1.date_input("Data", datetime.today())
-        importo = c2.number_input("Importo (€)", min_value=0.0, step=0.01)
+        cl = c1.text_input("Cliente")
+        nf = c2.text_input("N. Fattura")
+        dfat = c1.date_input("Data", datetime.today())
+        imp = c2.number_input("Importo (€)", step=0.01)
         
-        if st.form_submit_button("Registra"):
+        if st.form_submit_button("Salva su Google"):
             new_row = {
-                "Cliente": cliente, "N. Fattura": n_fatt,
-                "Data Fatt.": data_f.strftime("%d/%m/%Y"),
-                "Importo Fatt. (€)": importo, "Importo Pagato (€)": 0.0,
-                "Saldo (€)": importo, "Stato": "Non Pagata", "Data Saldo": ""
+                "Cliente": cl, "N. Fattura": nf, 
+                "Data Fatt.": dfat.strftime("%d/%m/%Y"),
+                "Importo Fatt. (€)": imp, "Importo Pagato (€)": 0.0,
+                "Saldo (€)": imp, "Stato": "Non Pagata", "Data Saldo": ""
             }
             df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
             save_data(df)
-            st.success("Registrato!")
+            st.success("Fattura salvata online!")
+            st.rerun()
 
 # 3. GESTIONE
 elif scelta == "Gestione Tabella":
-    st.header("📝 Modifica Dati")
-    st.info("Modifica i valori (es. Importo Pagato) e premi Salva.")
-    df_edit = st.data_editor(df, num_rows="dynamic", use_container_width=True, key="edit")
-    
-    if st.button("💾 Salva Modifiche"):
-        for i, row in df_edit.iterrows():
+    st.header("📝 Modifica Live")
+    edited = st.data_editor(df, num_rows="dynamic", use_container_width=True)
+    if st.button("💾 Sincronizza Google Sheets"):
+        for i, row in edited.iterrows():
             s, st_val, d_s = calcola_stato_saldo(row)
-            df_edit.at[i, "Saldo (€)"] = s
-            df_edit.at[i, "Stato"] = st_val
-            df_edit.at[i, "Data Saldo"] = d_s
-        save_data(df_edit)
-        st.success("Salvato!")
+            edited.at[i, "Saldo (€)"] = s
+            edited.at[i, "Stato"] = st_val
+            edited.at[i, "Data Saldo"] = d_s
+        save_data(edited)
+        st.success("Foglio Google Aggiornato!")
         st.rerun()
 
-# 4. IMPORTA
+# 4. IMPORTA CSV (Versione Cloud)
 elif scelta == "Importa CSV":
-    st.header("📂 Importa CSV")
+    st.header("📂 Carica CSV su Google Sheets")
+    st.markdown("Usa questo strumento per caricare i tuoi vecchi dati nel Cloud.")
     uploaded = st.file_uploader("File CSV", type=["csv"])
+    
     if uploaded:
-        try:
-            df_new = try_read_csv(uploaded)
-            if not [c for c in COLONNE if c not in df_new.columns]:
-                st.success(f"Letto correttamente! {len(df_new)} righe.")
-                if st.button("Unisci Dati"):
-                    df_new = df_new[COLONNE]
+        df_new = try_read_csv_upload(uploaded)
+        if not df_new.empty:
+            # Filtra solo colonne valide
+            valid_cols = [c for c in COLONNE if c in df_new.columns]
+            if len(valid_cols) == len(COLONNE):
+                st.success(f"File valido! {len(df_new)} righe trovate.")
+                if st.button("Aggiungi questi dati al Cloud"):
+                    # Pulisce numeri
                     for col in ["Importo Fatt. (€)", "Importo Pagato (€)", "Saldo (€)"]:
                         df_new[col] = pd.to_numeric(
                             df_new[col].astype(str).str.replace('€','').str.replace(',','.'), 
                             errors='coerce').fillna(0)
-                    df_comb = pd.concat([df, df_new], ignore_index=True)
+                    
+                    df_comb = pd.concat([df, df_new[COLONNE]], ignore_index=True)
                     save_data(df_comb)
-                    st.success("Fatto!")
+                    st.balloons()
+                    st.success("Dati caricati su Google Sheets con successo!")
             else:
-                st.error("Colonne errate.")
-        except Exception as e:
-            st.error(f"Errore: {e}")
+                st.error("Il file non ha le colonne giuste.")
