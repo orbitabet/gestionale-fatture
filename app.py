@@ -5,7 +5,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
 import os
 
-# --- CONFIGURAZIONE PAGINA (Prima istruzione obbligatoria) ---
+# --- CONFIGURAZIONE PAGINA ---
 st.set_page_config(
     page_title="Gestionale Fatture (Cloud)", 
     page_icon="☁️", 
@@ -13,7 +13,6 @@ st.set_page_config(
 )
 
 # --- CONFIGURAZIONE GOOGLE SHEETS ---
-# Il nome del tuo foglio Google creato in precedenza
 SHEET_NAME = "gestionale_db" 
 SCOPE = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
 
@@ -24,14 +23,42 @@ COLONNE = [
     "Saldo (€)", "Stato", "Data Saldo"
 ]
 
+# --- FUNZIONE INTELLIGENTE PER I NUMERI (FIX VIRGOLE/PUNTI) ---
+def pulisci_numero(valore):
+    """
+    Converte stringhe in numeri gestendo sia il formato 1.000,00 che 1000.00
+    """
+    if pd.isna(valore) or str(valore).strip() == "":
+        return 0.0
+    
+    s = str(valore).replace("€", "").strip()
+    
+    try:
+        # CASO 1: Formato Italiano complesso (1.000,50) -> Punto=Migliaia, Virgola=Decimali
+        if "." in s and "," in s and s.find(".") < s.find(","):
+            s = s.replace(".", "") # Via i punti delle migliaia
+            s = s.replace(",", ".") # La virgola diventa punto per Python
+            
+        # CASO 2: Formato Americano complesso (1,000.50) -> Virgola=Migliaia, Punto=Decimali
+        elif "." in s and "," in s and s.find(",") < s.find("."):
+            s = s.replace(",", "") # Via le virgole delle migliaia
+            
+        # CASO 3: Solo virgola (400,50) -> Diventa 400.50
+        elif "," in s:
+            s = s.replace(",", ".")
+            
+        # CASO 4: Solo punto (400.50) -> Resta così com'è (NON LO RIMUOVIAMO PIÙ)
+        
+        return float(s)
+    except:
+        return 0.0
+
 # --- CONNESSIONE GOOGLE ---
 def connect_google():
-    """Si connette a Google Sheets usando i segreti di Streamlit."""
     try:
         if "gcp_service_account" not in st.secrets:
-            st.error("Mancano le chiavi segrete (Secrets) nelle impostazioni di Streamlit!")
+            st.error("Mancano le chiavi segrete (Secrets)!")
             st.stop()
-            
         creds_dict = dict(st.secrets["gcp_service_account"])
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, SCOPE)
         client = gspread.authorize(creds)
@@ -48,34 +75,26 @@ def load_data():
         data = sheet.get_all_records()
         df = pd.DataFrame(data)
         
-        # Se il foglio è vuoto
-        if df.empty:
-            return pd.DataFrame(columns=COLONNE)
+        if df.empty: return pd.DataFrame(columns=COLONNE)
 
-        # Assicura presenza tutte colonne
         for col in COLONNE:
-            if col not in df.columns:
-                df[col] = ""
+            if col not in df.columns: df[col] = ""
 
-        # Pulizia numeri (Gestione formati europei e stringhe)
+        # Usa la nuova funzione pulisci_numero
         cols_num = ["Importo Fatt. (€)", "Importo Pagato (€)", "Saldo (€)"]
         for col in cols_num:
-            df[col] = pd.to_numeric(
-                df[col].astype(str).str.replace('€','').str.replace('.','').str.replace(',','.'), 
-                errors='coerce'
-            ).fillna(0)
+            df[col] = df[col].apply(pulisci_numero)
             
         return df[COLONNE]
     except Exception as e:
-        # Se fallisce (es. foglio vuoto senza intestazioni), ritorna vuoto
         return pd.DataFrame(columns=COLONNE)
 
 # --- SALVATAGGIO DATI ---
 def save_data(df):
     sheet = connect_google()
     try:
-        sheet.clear() # Pulisce il foglio
-        # Prepara i dati per Google (converte tutto in stringa per sicurezza)
+        sheet.clear() 
+        # Convertiamo tutto in stringa per Google Sheets
         dati_lista = [df.columns.values.tolist()] + df.astype(str).values.tolist()
         sheet.update(dati_lista)
     except Exception as e:
@@ -83,9 +102,9 @@ def save_data(df):
 
 # --- CALCOLI ---
 def calcola_stato_saldo(row):
-    # Converte in float gestendo eventuali virgole
-    importo = float(str(row["Importo Fatt. (€)"]).replace(',','.'))
-    pagato = float(str(row["Importo Pagato (€)"]).replace(',','.'))
+    # Usa la funzione pulisci_numero anche qui per sicurezza
+    importo = pulisci_numero(row["Importo Fatt. (€)"])
+    pagato = pulisci_numero(row["Importo Pagato (€)"])
     saldo = importo - pagato
     
     stato = "Non Pagata"
@@ -94,14 +113,14 @@ def calcola_stato_saldo(row):
     if saldo <= 0.01:
         saldo = 0
         stato = "Pagata"
-        if pd.isna(data_saldo) or str(data_saldo).strip() in ["", "nan"]:
+        if pd.isna(data_saldo) or str(data_saldo).strip() in ["", "nan", "None"]:
             data_saldo = datetime.today().strftime("%d/%m/%Y")
     elif pagato > 0:
         stato = "Parziale"
         
     return saldo, stato, data_saldo
 
-# --- FUNZIONI CSV (Per importazione) ---
+# --- FUNZIONI CSV ---
 def clean_column_names_csv(df):
     new_columns = []
     for col in df.columns:
@@ -122,11 +141,10 @@ def try_read_csv_upload(file_source):
                 df = clean_column_names_csv(df)
                 if len(df.columns) > 1 and "Cliente" in df.columns: return df
             except: continue
-    return pd.DataFrame() # Vuoto se fallisce
+    return pd.DataFrame()
 
 # --- INTERFACCIA ---
 with st.sidebar:
-    # LOGO
     if os.path.exists("logo.png"): st.image("logo.png", width=250)
     elif os.path.exists("logo.jpg"): st.image("logo.jpg", width=250)
     
@@ -167,8 +185,10 @@ if scelta == "Dashboard & Analisi":
             kc3.metric("Debito", f"€ {c_sal:,.2f}", delta_color="inverse")
             st.dataframe(sub, use_container_width=True)
         else:
-            # Classifica debitori
-            grp = df.groupby("Cliente")[["Saldo (€)"]].sum().reset_index().sort_values("Saldo (€)", ascending=False)
+            # Raggruppa e somma
+            grp = df.groupby("Cliente")[["Saldo (€)"]].sum().reset_index()
+            # Ordina dal debito più alto
+            grp = grp.sort_values("Saldo (€)", ascending=False)
             st.bar_chart(grp.set_index("Cliente"))
     else:
         st.info("Database vuoto. Inserisci fatture o importa CSV.")
@@ -209,25 +229,23 @@ elif scelta == "Gestione Tabella":
         st.success("Foglio Google Aggiornato!")
         st.rerun()
 
-# 4. IMPORTA CSV (Versione Cloud)
+# 4. IMPORTA CSV
 elif scelta == "Importa CSV":
     st.header("📂 Carica CSV su Google Sheets")
-    st.markdown("Usa questo strumento per caricare i tuoi vecchi dati nel Cloud.")
     uploaded = st.file_uploader("File CSV", type=["csv"])
     
     if uploaded:
         df_new = try_read_csv_upload(uploaded)
         if not df_new.empty:
-            # Filtra solo colonne valide
             valid_cols = [c for c in COLONNE if c in df_new.columns]
             if len(valid_cols) == len(COLONNE):
                 st.success(f"File valido! {len(df_new)} righe trovate.")
+                st.dataframe(df_new.head(3))
+                
                 if st.button("Aggiungi questi dati al Cloud"):
-                    # Pulisce numeri
+                    # Applica la pulizia numeri anche qui
                     for col in ["Importo Fatt. (€)", "Importo Pagato (€)", "Saldo (€)"]:
-                        df_new[col] = pd.to_numeric(
-                            df_new[col].astype(str).str.replace('€','').str.replace(',','.'), 
-                            errors='coerce').fillna(0)
+                        df_new[col] = df_new[col].apply(pulisci_numero)
                     
                     df_comb = pd.concat([df, df_new[COLONNE]], ignore_index=True)
                     save_data(df_comb)
